@@ -41,40 +41,49 @@ async def read_root():
     with open("static/index.html") as f:
         return f.read()
 
-def draw_number_label(image, box, number):
-    """Draw a number label with a background circle on the image."""
-    x1, y1 = int(box[0]), int(box[1])  # Use top-left corner of bounding box
-    
+def draw_number_label(image, mask, number):
+    """Draw a number label at the centroid of the mask."""
+    # Calculate mask centroid
+    moments = cv2.moments(mask.astype(np.uint8))
+    if moments["m00"] != 0:
+        centroid_x = int(moments["m10"] / moments["m00"])
+        centroid_y = int(moments["m01"] / moments["m00"])
+    else:
+        # Fallback to mask bounds if moments calculation fails
+        y, x = np.where(mask)
+        if len(x) > 0 and len(y) > 0:
+            centroid_x = int(np.mean(x))
+            centroid_y = int(np.mean(y))
+        else:
+            return image
+
     # Convert numpy array to PIL Image for drawing
     img_pil = Image.fromarray(image)
     draw = ImageDraw.Draw(img_pil)
     
     # Calculate circle position and size
     circle_radius = 12
-    circle_x = x1
-    circle_y = y1
     
     # Draw white circle background
     draw.ellipse(
         [
-            circle_x - circle_radius, 
-            circle_y - circle_radius,
-            circle_x + circle_radius, 
-            circle_y + circle_radius
+            centroid_x - circle_radius, 
+            centroid_y - circle_radius,
+            centroid_x + circle_radius, 
+            centroid_y + circle_radius
         ],
         fill='white',
         outline='black'
     )
     
     # Draw number
-    # Use default font since custom fonts might not be available
     text = str(number)
     text_bbox = draw.textbbox((0, 0), text)
     text_width = text_bbox[2] - text_bbox[0]
     text_height = text_bbox[3] - text_bbox[1]
     
-    text_x = circle_x - text_width // 2
-    text_y = circle_y - text_height // 2
+    text_x = centroid_x - text_width // 2
+    text_y = centroid_y - text_height // 2
     draw.text((text_x, text_y), text, fill='black')
     
     return np.array(img_pil)
@@ -100,22 +109,29 @@ async def detect_objects(file: UploadFile = File(...)):
         if not results or not results[0].masks:
             return JSONResponse({"error": "No objects detected"})
 
-        # Get bounding boxes, class names, and confidence scores
-        boxes = results[0].boxes.data.cpu().numpy()
+        # Get masks and class information
+        masks = results[0].masks
+        boxes = results[0].boxes
         class_names = results[0].names
         
         # Prepare detection results and draw numbers
         detections = []
-        for i, box in enumerate(boxes):
-            x1, y1, x2, y2, conf, class_id = box
+        for i, (mask, box) in enumerate(zip(masks, boxes)):
+            mask_array = mask.data[0].cpu().numpy()
+            mask_array = cv2.resize(mask_array, (image.shape[1], image.shape[0]))
+            mask_array = mask_array > 0.5
+
+            box_data = box.data.cpu().numpy()[0]
+            conf, class_id = box_data[4], int(box_data[5])
+            
             detections.append({
                 "id": i,
-                "bbox": [float(x1), float(y1), float(x2), float(y2)],
                 "confidence": float(conf),
-                "class": class_names[int(class_id)]
+                "class": class_names[class_id]
             })
-            # Draw number label on the image
-            labeled_image = draw_number_label(labeled_image, box, i + 1)
+            
+            # Draw number label on the image using mask centroid
+            labeled_image = draw_number_label(labeled_image, mask_array, i + 1)
 
         # Convert labeled image to base64
         buffered = BytesIO()
@@ -158,12 +174,16 @@ async def segment_objects(request: SegmentationRequest):
                 mask = cv2.resize(mask, (image.shape[1], image.shape[0]))
                 combined_mask = cv2.bitwise_or(combined_mask, (mask > 0.5).astype(np.uint8))
 
-        # Apply the combined mask
-        masked_image = cv2.bitwise_and(image, image, mask=combined_mask)
+        # Create a red overlay
+        overlay = image.copy()
+        overlay[combined_mask == 1] = [255, 200, 200]  # Light red color
+
+        # Blend the overlay with the original image
+        output = cv2.addWeighted(overlay, 0.7, image, 0.3, 0)
 
         # Convert to base64
         buffered = BytesIO()
-        Image.fromarray(masked_image).save(buffered, format="JPEG")
+        Image.fromarray(output).save(buffered, format="JPEG")
         img_str = base64.b64encode(buffered.getvalue()).decode()
 
         return JSONResponse({
