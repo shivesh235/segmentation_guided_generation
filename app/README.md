@@ -1,1 +1,3 @@
-# segmentation_guided_generation
+# Segmentation Guided Generation
+
+uvicorn app:app

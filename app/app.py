@@ -1,16 +1,15 @@
-from fastapi import FastAPI, File, UploadFile, Body
-from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-import cv2
-import numpy as np
-from io import BytesIO
-from PIL import Image, ImageDraw, ImageFont
-import logging
-from typing import List
-from ultralytics import YOLO
-import base64
 from pydantic import BaseModel
+from typing import List, Optional
+import torch
+from diffusers import AutoPipelineForInpainting
+from PIL import Image
+import numpy as np
+import cv2
+import io
+import base64
 
 app = FastAPI()
 
@@ -23,173 +22,94 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# Initialize the inpainting pipeline for CPU
+pipeline = AutoPipelineForInpainting.from_pretrained(
+    "runwayml/stable-diffusion-inpainting"
+)
+pipeline.to("cpu")  # Set the pipeline to use CPU
 
-# Load YOLOv8 Model
-model = YOLO('yolov8s-seg.pt')
+class SelectionRequest(BaseModel):
+    image_data: str  # Base64 encoded image
+    x: int  # Starting x coordinate
+    y: int  # Starting y coordinate
+    width: int
+    height: int
+    prompt: str
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+def base64_to_image(base64_str: str):
+    """Convert base64 string to PIL Image"""
+    try:
+        image_data = base64.b64decode(base64_str.split(",")[1])
+        return Image.open(io.BytesIO(image_data)).convert("RGB")
+    except:
+        image_data = base64.b64decode(base64_str)
+        return Image.open(io.BytesIO(image_data)).convert("RGB")
 
-class SegmentationRequest(BaseModel):
-    selected_indices: List[int]
-    image_data: str
+def image_to_base64(image: Image.Image) -> str:
+    """Convert PIL Image to base64 string"""
+    buffered = io.BytesIO()
+    image.save(buffered, format="PNG")
+    img_str = base64.b64encode(buffered.getvalue()).decode()
+    return f"data:image/png;base64,{img_str}"
 
-@app.get("/", response_class=HTMLResponse)
-async def read_root():
-    with open("static/index.html") as f:
-        return f.read()
+def create_mask(width: int, height: int, x: int, y: int, box_width: int, box_height: int) -> Image.Image:
+    """Create a mask image with the selected region"""
+    mask = Image.new('RGB', (width, height), 'black')
+    mask_draw = cv2.cvtColor(np.array(mask), cv2.COLOR_RGB2BGR)
+    cv2.rectangle(mask_draw, (x, y), (x + box_width, y + box_height), (255, 255, 255), -1)
+    return Image.fromarray(cv2.cvtColor(mask_draw, cv2.COLOR_BGR2RGB))
 
-def draw_number_label(image, mask, number):
-    """Draw a number label at the centroid of the mask."""
-    # Calculate mask centroid
-    moments = cv2.moments(mask.astype(np.uint8))
-    if moments["m00"] != 0:
-        centroid_x = int(moments["m10"] / moments["m00"])
-        centroid_y = int(moments["m01"] / moments["m00"])
-    else:
-        # Fallback to mask bounds if moments calculation fails
-        y, x = np.where(mask)
-        if len(x) > 0 and len(y) > 0:
-            centroid_x = int(np.mean(x))
-            centroid_y = int(np.mean(y))
-        else:
-            return image
+@app.post("/upload/")
+async def upload_image(file: UploadFile = File(...)):
+    """Endpoint to upload and return the original image"""
+    contents = await file.read()
+    image = Image.open(io.BytesIO(contents)).convert("RGB")
+    return JSONResponse({
+        "image": image_to_base64(image),
+        "width": image.width,
+        "height": image.height
+    })
 
-    # Convert numpy array to PIL Image for drawing
-    img_pil = Image.fromarray(image)
-    draw = ImageDraw.Draw(img_pil)
+@app.post("/inpaint/")
+async def inpaint_region(request: SelectionRequest):
+    """Endpoint to perform inpainting on selected region"""
+    # Convert base64 to image
+    init_image = base64_to_image(request.image_data)
     
-    # Calculate circle position and size
-    circle_radius = 12
-    
-    # Draw white circle background
-    draw.ellipse(
-        [
-            centroid_x - circle_radius, 
-            centroid_y - circle_radius,
-            centroid_x + circle_radius, 
-            centroid_y + circle_radius
-        ],
-        fill='white',
-        outline='black'
+    # Create mask for selected region
+    mask_image = create_mask(
+        init_image.width,
+        init_image.height,
+        request.x,
+        request.y,
+        request.width,
+        request.height
     )
     
-    # Draw number
-    text = str(number)
-    text_bbox = draw.textbbox((0, 0), text)
-    text_width = text_bbox[2] - text_bbox[0]
-    text_height = text_bbox[3] - text_bbox[1]
+    # Ensure images are the correct size (multiple of 8)
+    def process_image(img: Image.Image) -> Image.Image:
+        w, h = img.size
+        w = (w // 8) * 8
+        h = (h // 8) * 8
+        return img.resize((w, h))
+
+    init_image = process_image(init_image)
+    mask_image = process_image(mask_image)
     
-    text_x = centroid_x - text_width // 2
-    text_y = centroid_y - text_height // 2
-    draw.text((text_x, text_y), text, fill='black')
+    # Generate image on CPU
+    output_image = pipeline(
+        prompt=request.prompt,
+        image=init_image,
+        mask_image=mask_image,
+        num_inference_steps=50
+    ).images[0]
     
-    return np.array(img_pil)
+    return JSONResponse({
+        "original_image": image_to_base64(init_image),
+        "mask_image": image_to_base64(mask_image),
+        "result_image": image_to_base64(output_image)
+    })
 
-@app.post("/detect/")
-async def detect_objects(file: UploadFile = File(...)):
-    try:
-        # Read and process image
-        image_data = await file.read()
-        image = np.array(Image.open(BytesIO(image_data)))
-        
-        if image.shape[-1] == 4:
-            image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
-        elif len(image.shape) == 2:
-            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-
-        # Make a copy of the image for drawing labels
-        labeled_image = image.copy()
-
-        # Run YOLOv8 detection
-        results = model(image)
-        
-        if not results or not results[0].masks:
-            return JSONResponse({"error": "No objects detected"})
-
-        # Get masks and class information
-        masks = results[0].masks
-        boxes = results[0].boxes
-        class_names = results[0].names
-        
-        # Prepare detection results and draw numbers
-        detections = []
-        for i, (mask, box) in enumerate(zip(masks, boxes)):
-            mask_array = mask.data[0].cpu().numpy()
-            mask_array = cv2.resize(mask_array, (image.shape[1], image.shape[0]))
-            mask_array = mask_array > 0.5
-
-            box_data = box.data.cpu().numpy()[0]
-            conf, class_id = box_data[4], int(box_data[5])
-            
-            detections.append({
-                "id": i,
-                "confidence": float(conf),
-                "class": class_names[class_id]
-            })
-            
-            # Draw number label on the image using mask centroid
-            labeled_image = draw_number_label(labeled_image, mask_array, i + 1)
-
-        # Convert labeled image to base64
-        buffered = BytesIO()
-        Image.fromarray(labeled_image).save(buffered, format="JPEG")
-        img_str = base64.b64encode(buffered.getvalue()).decode()
-
-        return JSONResponse({
-            "detections": detections,
-            "image": f"data:image/jpeg;base64,{img_str}"
-        })
-
-    except Exception as e:
-        logger.error(f"Error processing image: {e}")
-        return JSONResponse({"error": str(e)})
-
-@app.post("/segment/")
-async def segment_objects(request: SegmentationRequest):
-    try:
-        # Decode base64 image
-        image_data = base64.b64decode(request.image_data.split(',')[1])
-        image = np.array(Image.open(BytesIO(image_data)))
-        
-        if image.shape[-1] == 4:
-            image = cv2.cvtColor(image, cv2.COLOR_RGBA2RGB)
-        elif len(image.shape) == 2:
-            image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-
-        # Run YOLOv8 detection
-        results = model(image)
-        
-        if not results or not results[0].masks:
-            return JSONResponse({"error": "No objects detected"})
-
-        # Create combined mask from selected objects
-        combined_mask = np.zeros((image.shape[0], image.shape[1]), dtype=np.uint8)
-        
-        for idx in request.selected_indices:
-            if idx < len(results[0].masks):
-                mask = results[0].masks[idx].data[0].cpu().numpy()
-                mask = cv2.resize(mask, (image.shape[1], image.shape[0]))
-                combined_mask = cv2.bitwise_or(combined_mask, (mask > 0.5).astype(np.uint8))
-
-        # Create a red overlay
-        overlay = image.copy()
-        overlay[combined_mask == 1] = [255, 200, 200]  # Light red color
-
-        # Blend the overlay with the original image
-        output = cv2.addWeighted(overlay, 0.7, image, 0.3, 0)
-
-        # Convert to base64
-        buffered = BytesIO()
-        Image.fromarray(output).save(buffered, format="JPEG")
-        img_str = base64.b64encode(buffered.getvalue()).decode()
-
-        return JSONResponse({
-            "segmented_image": f"data:image/jpeg;base64,{img_str}"
-        })
-
-    except Exception as e:
-        logger.error(f"Error processing image: {e}")
-        return JSONResponse({"error": str(e)})
+# if __name__ == "__main__":
+#     import uvicorn
+#     uvicorn.run(app, host="0.0.0.0", port=8000)
